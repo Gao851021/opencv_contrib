@@ -1204,7 +1204,7 @@ void TSDFVolumeGPU::integrate(InputArray _depth, float depthFactor,
     cv::String errorStr;
     cv::String name = "integrate";
     ocl::ProgramSource source = ocl::rgbd::tsdf_oclsrc;
-    cv::String options = "-cl-fast-relaxed-math -cl-mad-enable";
+    cv::String options = "-cl-mad-enable";
     ocl::Kernel k;
     k.create(name.c_str(), source, options, &errorStr);
 
@@ -1250,7 +1250,7 @@ void TSDFVolumeGPU::raycast(cv::Affine3f cameraPose, Intr intrinsics, Size frame
     cv::String errorStr;
     cv::String name = "raycast";
     ocl::ProgramSource source = ocl::rgbd::tsdf_oclsrc;
-    cv::String options = "-cl-fast-relaxed-math -cl-mad-enable";
+    cv::String options = "-cl-mad-enable";
     ocl::Kernel k;
     k.create(name.c_str(), source, options, &errorStr);
 
@@ -1318,7 +1318,7 @@ void TSDFVolumeGPU::fetchNormals(InputArray _points, OutputArray _normals) const
         cv::String errorStr;
         cv::String name = "getNormals";
         ocl::ProgramSource source = ocl::rgbd::tsdf_oclsrc;
-        cv::String options = "-cl-fast-relaxed-math -cl-mad-enable";
+        cv::String options = "-cl-mad-enable";
         ocl::Kernel k;
         k.create(name.c_str(), source, options, &errorStr);
 
@@ -1365,7 +1365,7 @@ void TSDFVolumeGPU::fetchPointsNormals(OutputArray points, OutputArray normals) 
 
         cv::String errorStr;
         ocl::ProgramSource source = ocl::rgbd::tsdf_oclsrc;
-        cv::String options = "-cl-fast-relaxed-math -cl-mad-enable";
+        cv::String options = "-cl-mad-enable";
 
         kscan.create("scanSize", source, options, &errorStr);
 
@@ -1393,7 +1393,7 @@ void TSDFVolumeGPU::fetchPointsNormals(OutputArray points, OutputArray normals) 
                       (int)divUp(globalSize[2], (unsigned int)localSize[2]));
 
         const size_t counterSize = sizeof(int);
-        size_t lsz = localSize[0]*localSize[1]*localSize[2]*counterSize;
+        size_t lszscan = localSize[0]*localSize[1]*localSize[2]*counterSize;
 
         const int gsz[3] = {ngroups[2], ngroups[1], ngroups[0]};
         UMat groupedSum(3, gsz, CV_32S, Scalar(0));
@@ -1409,8 +1409,7 @@ void TSDFVolumeGPU::fetchPointsNormals(OutputArray points, OutputArray normals) 
                    ocl::KernelArg::PtrReadOnly(volPoseGpu),
                    voxelSize,
                    voxelSizeInv,
-                   //TODO: replace by KernelArg::Local(lsz)
-                   ocl::KernelArg(ocl::KernelArg::LOCAL, 0, 1, 1, 0, lsz),
+                   ocl::KernelArg::Local(lszscan),
                    ocl::KernelArg::WriteOnlyNoSize(groupedSum));
 
         if(!kscan.run(3, globalSize, localSize, true))
@@ -1423,12 +1422,6 @@ void TSDFVolumeGPU::fetchPointsNormals(OutputArray points, OutputArray normals) 
 
         // 2. fill output arrays according to per-group points count
 
-        ocl::Kernel kfill;
-        kfill.create("fillPtsNrm", source, options, &errorStr);
-
-        if(kfill.empty())
-            throw std::runtime_error("Failed to create kernel: " + errorStr);
-
         points.create(gpuSum, 1, POINT_TYPE);
         UMat pts = points.getUMat();
         UMat nrm;
@@ -1439,32 +1432,41 @@ void TSDFVolumeGPU::fetchPointsNormals(OutputArray points, OutputArray normals) 
         }
         else
         {
-            // it won't access but empty args are forbidden
+            // it won't be accessed but empty args are forbidden
             nrm = UMat(1, 1, POINT_TYPE);
         }
-        UMat atomicCtr(1, 1, CV_32S, Scalar(0));
 
-        // mem size to keep pts (and normals optionally) for all work-items in a group
-        lsz = localSize[0]*localSize[1]*localSize[2]*elemSize;
+        if (gpuSum)
+        {
+            ocl::Kernel kfill;
+            kfill.create("fillPtsNrm", source, options, &errorStr);
 
-        kfill.args(ocl::KernelArg::PtrReadOnly(volume),
-                   volResGpu.val,
-                   volDims.val,
-                   neighbourCoords.val,
-                   ocl::KernelArg::PtrReadOnly(volPoseGpu),
-                   voxelSize,
-                   voxelSizeInv,
-                   ((int)needNormals),
-                   //TODO: replace by ::Local(lsz)
-                   ocl::KernelArg(ocl::KernelArg::LOCAL, 0, 1, 1, 0, lsz),
-                   ocl::KernelArg::PtrReadWrite(atomicCtr),
-                   ocl::KernelArg::ReadOnlyNoSize(groupedSum),
-                   ocl::KernelArg::WriteOnlyNoSize(pts),
-                   ocl::KernelArg::WriteOnlyNoSize(nrm)
-                   );
+            if(kfill.empty())
+                throw std::runtime_error("Failed to create kernel: " + errorStr);
 
-        if(!kfill.run(3, globalSize, localSize, true))
-            throw std::runtime_error("Failed to run kernel");
+            UMat atomicCtr(1, 1, CV_32S, Scalar(0));
+
+            // mem size to keep pts (and normals optionally) for all work-items in a group
+            size_t lszfill = localSize[0]*localSize[1]*localSize[2]*elemSize;
+
+            kfill.args(ocl::KernelArg::PtrReadOnly(volume),
+                       volResGpu.val,
+                       volDims.val,
+                       neighbourCoords.val,
+                       ocl::KernelArg::PtrReadOnly(volPoseGpu),
+                       voxelSize,
+                       voxelSizeInv,
+                       ((int)needNormals),
+                       ocl::KernelArg::Local(lszfill),
+                       ocl::KernelArg::PtrReadWrite(atomicCtr),
+                       ocl::KernelArg::ReadOnlyNoSize(groupedSum),
+                       ocl::KernelArg::WriteOnlyNoSize(pts),
+                       ocl::KernelArg::WriteOnlyNoSize(nrm)
+                       );
+
+            if(!kfill.run(3, globalSize, localSize, true))
+                throw std::runtime_error("Failed to run kernel");
+        }
     }
 }
 
